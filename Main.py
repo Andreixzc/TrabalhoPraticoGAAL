@@ -1,115 +1,133 @@
-import tensorflow as tf
-import pandas as pd
+import numpy as np # linear algebra
+import pandas as pd # data processing, CSV file I/O (e.g. pd.read_csv)
 import os
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from tensorflow.keras.applications import EfficientNetB0
-from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
+import random
 
-# Configurações básicas
-batch_size = 32
-img_size = (224, 224)
-num_epochs = 10
-learning_rate = 1e-4
+import matplotlib.pyplot as plt
 
-# Caminhos para os dados
-train_dir = 'Datasets/train'
-test_dir = 'Datasets/test'
-train_csv = 'Datasets/Training_set.csv'
-test_csv = 'Datasets/Testing_set.csv'
+from PIL import Image
 
-# Carregar dados de treinamento e teste
-train_df = pd.read_csv(train_csv)
-test_df = pd.read_csv(test_csv)
+import tensorflow as tf
+from tensorflow import keras
+import tensorflow_hub as hub
+from keras.layers import Dense, Dropout, Conv2D
 
-# Criação dos geradores de dados
-train_datagen = ImageDataGenerator(
-    rescale=1./255,
-    validation_split=0.2,  # Dividir o conjunto de treinamento em treinamento e validação
-    horizontal_flip=True,
-    zoom_range=0.2,
-    rotation_range=10
-)
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-test_datagen = ImageDataGenerator(rescale=1./255)
+from tqdm import tqdm
 
-train_generator = train_datagen.flow_from_dataframe(
-    train_df,
-    directory=train_dir,
-    x_col='filename',
-    y_col='label',
-    target_size=img_size,
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='training'
-)
+# Detect hardware, return appropriate distribution strategy
+try:
+    tpu = tf.distribute.cluster_resolver.TPUClusterResolver()  # TPU detection. No parameters necessary if TPU_NAME environment variable is set. On Kaggle this is always the case.
+    print('Running on TPU ', tpu.master())
+except ValueError:
+    print("No TPUs detected")
+    tpu = None
 
-validation_generator = train_datagen.flow_from_dataframe(
-    train_df,
-    directory=train_dir,
-    x_col='filename',
-    y_col='label',
-    target_size=img_size,
-    batch_size=batch_size,
-    class_mode='categorical',
-    subset='validation'
-)
+if tpu:
+    tf.config.experimental_connect_to_cluster(tpu)
+    tf.tpu.experimental.initialize_tpu_system(tpu)
+    strategy = tf.distribute.TPUStrategy(tpu)
+else:
+    strategy = tf.distribute.get_strategy() # default distribution strategy in Tensorflow. Works on CPU and single GPU.
 
-test_generator = test_datagen.flow_from_dataframe(
-    test_df,
-    directory=test_dir,
-    x_col='filename',
-    y_col=None,
-    target_size=img_size,
-    batch_size=batch_size,
-    class_mode=None,
-    shuffle=False
-)
+print("REPLICAS: ", strategy.num_replicas_in_sync)
 
-# Obter o número de classes
-num_classes = len(train_generator.class_indices)
 
-# Carregar o modelo EfficientNetB0 pré-treinado
-base_model = EfficientNetB0(include_top=False, weights='imagenet', input_shape=(224, 224, 3))
+INPUT_DIR = "input/butterfly-image-classification"
+TRAIN_DIR = f"{INPUT_DIR}/train"
+TEST_DIR = f"{INPUT_DIR}/test"
 
-# Congelar as camadas base
-base_model.trainable = False
+# we will only use the training set provided, split this into a training and validation
+# set, and use these to train our model
+meta_df = pd.read_csv(os.path.join(INPUT_DIR, "Training_set.csv"))
+meta_df.head()
 
-# Adicionar camadas de classificação
-x = base_model.output
-x = GlobalAveragePooling2D()(x)
-x = Dense(128, activation='relu')(x)
-predictions = Dense(num_classes, activation='softmax')(x)
 
-model = Model(inputs=base_model.input, outputs=predictions)
 
-# Compilar o modelo
-model.compile(optimizer=Adam(learning_rate=learning_rate),
-              loss='categorical_crossentropy',
-              metrics=['accuracy'])
+images = []
+labels = []
+label_encodings = []
 
-# Treinar o modelo
-history = model.fit(
-    train_generator,
-    validation_data=validation_generator,
-    epochs=num_epochs
-)
+label_encoder = LabelEncoder()
+meta_df["label_encoding"] = label_encoder.fit_transform(meta_df["label"])
+pbar = tqdm(list(meta_df.iterrows()))
 
-# Descongelar as camadas do modelo base para fine-tuning
-base_model.trainable = True
+for index, entry in pbar: 
+    image = np.asarray(Image.open(os.path.join(TRAIN_DIR, entry["filename"])))
+    label = entry["label"]
+    label_encoding = entry["label_encoding"]
+    
+    images.append(image)
+    labels.append(label)
+    label_encodings.append(label_encoding)
 
-# Recompilar o modelo com uma taxa de aprendizado menor
-model.compile(optimizer=Adam(learning_rate=learning_rate / 10),
-              loss='categorical_crossentropy',
-              metrics=['accuracy'])
 
-# Continuar o treinamento (fine-tuning)
-history_fine = model.fit(
-    train_generator,
-    validation_data=validation_generator,
-    epochs=num_epochs
-)
 
-# Salvar o modelo treinado
-model.save('fine_tuned_efficientnet.h5')
+
+with strategy.scope():
+    efficient_net = hub.KerasLayer("https://www.kaggle.com/models/google/efficientnet-v2/frameworks/TensorFlow2/variations/imagenet21k-b3-feature-vector/versions/1",
+                   trainable=False)
+    
+    model = keras.Sequential([
+        efficient_net,
+#         keras.layers.GlobalAveragePooling2D(),
+        keras.layers.Dense(256, activation='relu'),
+        keras.layers.Dense(256, activation='relu'),
+        keras.layers.Dense(75, activation='softmax'),
+    ])
+    
+    model.build([None, 224, 224, 3])
+    
+    model.compile(optimizer=keras.optimizers.Adam(learning_rate=5e-4),
+              loss='sparse_categorical_crossentropy',
+              metrics=['sparse_categorical_accuracy'])
+
+
+np_images = np.asarray(images).astype('float64') / 255
+np_label_encodings = np.asarray(label_encodings).astype('float64')
+print(f"Shape of images: {np_images.shape}")
+print(f"Shape of label encodings: {np_label_encodings.shape}")
+images_train, images_test, label_encodings_train, label_encodings_test = train_test_split(np_images, np_label_encodings, train_size=0.7)
+print(f"Shape of training images: {images_train.shape}")
+print(f"Shape of training label encodings: {label_encodings_train.shape}")
+print(f"Shape of validation images: {images_test.shape}")
+print(f"Shape of validation label encodings: {label_encodings_test.shape}")
+train_dataset = tf.data.Dataset.from_tensor_slices((images_train, label_encodings_train)).repeat().shuffle(10000).batch(64)
+test_dataset = tf.data.Dataset.from_tensor_slices((images_test, label_encodings_test)).batch(1)
+EPOCHS = 5
+STEPS_PER_EPOCH = 2000
+VALIDATION_STEPS = 1000
+
+history = model.fit(train_dataset, epochs=EPOCHS,
+                    steps_per_epoch=STEPS_PER_EPOCH,
+                    validation_data=test_dataset)
+
+
+fig, axes = plt.subplots(nrows=5, ncols=5, figsize=(25,25))
+
+sample_test_dataset = test_dataset.take(25)
+sample_test_dataset_np = [(image, label_encoding) for (image, label_encoding) in sample_test_dataset]
+predictions = model.predict(sample_test_dataset).argmax(axis=1)
+
+for ax, (image, act_label_encoding), pred_label_encoding in zip(axes.flat, sample_test_dataset, predictions):
+    actual_label_encoding_np = act_label_encoding.numpy().astype(int)
+    actual_label_name = label_encoder.inverse_transform(actual_label_encoding_np)[0]
+    
+    pred_label_encoding_np = pred_label_encoding.astype(int)
+    pred_label_name = label_encoder.inverse_transform([pred_label_encoding_np])[0]
+    
+    ax.imshow(image.numpy().reshape(224, 224, 3))
+    ax.set(title=f"Predicted: {pred_label_name}\nActual: {actual_label_name}")
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+test_predictions = model.predict(test_dataset).argmax(axis=1).astype(int)
+test_actual = [label_encoding.numpy()[0].astype(int) for (image, label_encoding) in test_dataset]
+
+print(f"Accuracy: {accuracy_score(test_predictions, test_actual)}")
+print(f"Precision: {precision_score(test_predictions, test_actual, average='macro')}")
+print(f"Recall: {recall_score(test_predictions, test_actual, average='macro')}")
+print(f"F1 score: {f1_score(test_predictions, test_actual, average='macro')}")
